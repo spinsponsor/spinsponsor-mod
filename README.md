@@ -8,10 +8,28 @@ SpinSponsor shows one labelled sponsored line while Claude works, in place of th
 
 Independent product, operated by SecAI Ltd. Not affiliated with Anthropic.
 
-## What you need
+## First, check your Claude Code version
 
-- Claude Code **2.1.295 or newer** (check with `claude --version`). On an older version the Mod shows no ads.
-- Claude Code in a terminal (including the terminal inside VS Code or JetBrains), or the Claude Desktop app's **Code** tab.
+The Mod needs Claude Code **2.1.295 or newer**. In your terminal (not inside Claude Code), run:
+
+```bash
+claude --version
+```
+
+It prints something like `2.1.310 (Claude Code)`. If your number is lower than 2.1.295, update before you install, or the install fails (see [If the install fails](#if-the-install-fails)). How you update depends on how you installed Claude Code:
+
+| You installed Claude Code with | Update with |
+| --- | --- |
+| The installer from claude.ai (most people) | `claude update` |
+| Homebrew | `brew upgrade claude-code` (or `brew upgrade claude-code@latest` if that's your cask) |
+| WinGet | `winget upgrade Anthropic.ClaudeCode` |
+| npm | `npm install -g @anthropic-ai/claude-code@latest` |
+
+Then run `claude --version` again to check. Homebrew and WinGet installs don't update themselves, so they are the ones most likely to be behind.
+
+Also:
+
+- Use Claude Code in a terminal (including the terminal inside VS Code or JetBrains), or the Claude Desktop app's **Code** tab. The Desktop app has its own copy of Claude Code: in a Code session, run `/status` and read the **Claude Code** row. If it is lower than 2.1.295, update the Desktop app.
 - Ads don't appear in the VS Code extension's chat panel, cloud sessions, WSL sessions in the Desktop app, or `claude -p` runs.
 
 ## Install
@@ -21,6 +39,8 @@ In your terminal (not inside Claude Code), run:
 ```bash
 claude plugin install spinsponsor --marketplace https://github.com/spinsponsor/spinsponsor-mod.git
 ```
+
+Copy the command as it is: shortening the address to `owner/repo` can run into a GitHub SSH-key problem on some machines.
 
 Or, at the Claude Code prompt, run the same thing as `/plugin install spinsponsor --marketplace https://github.com/spinsponsor/spinsponsor-mod.git` and choose **Install for you (user scope)**.
 
@@ -36,6 +56,15 @@ It shows a link and a code. Approve the code on your SpinSponsor dashboard, and 
 
 The Desktop app installs plugins only from marketplaces you've already added, so run the install command above in a terminal once. A plugin installed for you (user scope) also loads in the Desktop app's local Code sessions. Then run `/ads login` in a Desktop Code session.
 
+## If the install fails
+
+Both of these mean your Claude Code is too old. Run `claude --version`, update as shown [above](#first-check-your-claude-code-version), then restart Claude Code and try again.
+
+- **`unknown option '--marketplace'`** when you run `claude plugin install`: the one-step install needs Claude Code 2.1.292 or newer.
+- **`Failed to load hooks from .../hooks/hooks.json`** with `expected record, received undefined` and `"hooks"` in the details: this Claude Code is older than 2.1.287 and can't read Mods at all. After you update and restart, the Mod loads. If the error stays, run `claude plugin uninstall spinsponsor@spinsponsor` and then the install command again.
+
+Still stuck? Email [contact@spinsponsor.com](mailto:contact@spinsponsor.com) with the output of `claude --version` and the full error message.
+
 ## Stay up to date
 
 Claude Code doesn't auto-update plugins from marketplaces like this one unless you switch it on. Please do:
@@ -44,9 +73,9 @@ Claude Code doesn't auto-update plugins from marketplaces like this one unless y
 2. Go to the **Marketplaces** tab and select **spinsponsor**.
 3. Select **Enable auto-update**.
 
-When an update arrives you'll see `Plugin updated: spinsponsor · Run /reload-plugins to apply`. Run `/reload-plugins`, or just start a new session.
+When an update arrives you'll see `Plugin updated: spinsponsor · Run /reload-plugins to apply`. Restart Claude Code instead: after a reload (version 0.2.36 and later) ads stay off until you restart.
 
-To update by hand instead, run this in your terminal, then `/reload-plugins` or start a new session:
+To update by hand instead, run this in your terminal, then restart Claude Code (a `/reload-plugins` keeps ads off until you do):
 
 ```bash
 claude plugin update spinsponsor@spinsponsor

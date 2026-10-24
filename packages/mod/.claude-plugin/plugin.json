@@ -1,6 +1,6 @@
 {
   "name": "spinsponsor",
-  "version": "0.2.35",
+  "version": "0.2.37",
   "description": "Shows one labelled sponsored line in the Claude Code spinner while Claude works, and shares the ad revenue with you",
   "author": {
     "name": "SpinSponsor"

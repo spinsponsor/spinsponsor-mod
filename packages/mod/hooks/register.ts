@@ -1,9 +1,16 @@
 import type { EngineInterface, Register } from 'claude-code'
 
-export const VERSION = '0.2.35'
+export const VERSION = '0.2.37'
 // One impression = one ad drawn for 5 continuous seconds while Claude works
 export const SLOT_MS = 5000
 export const FLUSH_EVERY_MS = 60_000
+// A command left running in the background (run_in_background, Monitor) can raise a sandbox prompt at any later moment. The engine
+// names the ones it tracks and says when they end (bgTasks below); for any other background sign, and for an engine that sends no
+// list of them, no ad is shown or counted for this long after the start (founder, 2026-10-23).
+// Not fail closed: a prompt raised after it can still be billed (SANDBOX-PROMPT-VIEWS-PLAN, "reduced, not closed").
+export const BACKGROUND_HOLD_MS = 120_000
+// How long the first load waits for its "session started" marker to be saved before giving up (ads then stay off)
+export const MARKER_WAIT_MS = 5000
 const FLUSH_AT = 50
 const MAX_QUEUE = 2000
 const MAX_EVENT_AGE_MS = 24 * 3600_000
@@ -114,6 +121,40 @@ const turns = new Set<string>()
 // before it turns ads off for the session (Codex reviews of 0.2.25 and 0.2.26: no earlier release can be made safe).
 // Nothing is saved until startup has read that state (no ad can start before startup anyway).
 const pendingAsks = new Map<string, string>()
+// Commands running (Bash, Monitor), by call id, each with the agent it belongs to. A sandbox network prompt can cover the ad with no
+// signal to this Mod (Claude Code 2.1.309 raises no PermissionRequest for it), so a command holds ads from its tool.call to its end.
+// A map of its own and never saved: saveDialogs writes all of pendingAsks to the session state, and a reload turns ads off anyway.
+const commandHolds = new Map<string, string>()
+// Background commands the engine tracks, by the task id its result named (Bash: backgroundTaskId, Monitor: taskId): no ad shown or
+// counted while one runs. Each leaves only on the engine's word that it ended: a Stop or SubagentStop snapshot (`background_tasks`)
+// that no longer lists it, or its completion notice. Never on a timer, a call's end, an agent's end or a turn's end; never saved
+// (a reload turns ads off anyway). Probe on engine 2.1.310: SANDBOX-PROMPT-VIEWS-PLAN, "Decided" 7.
+// The value says whether the task is old enough for a snapshot's silence to count (SNAPSHOT_GRACE_MS after it was recorded).
+const bgTasks = new Map<string, boolean>()
+// A snapshot is built a moment before this Mod gets it, so one built before a task was registered can still arrive after the Mod
+// recorded the task (Codex review, 2026-10-24): its silence says nothing of a task this young. A completion notice has no such delay.
+export const SNAPSHOT_GRACE_MS = 5000
+// Some snapshot with a readable list has arrived this session: the engine sends lists, so a Stop without one is a lapse, not a
+// missing feature, and tracked tasks stay tracked through it
+let listSeen = false
+// Tasks a Stop without a list handed to the window (before any list had been read), each with its "old enough" flag: a later list that
+// still shows one tracks it again, flag kept (Codex round 3: recovery must not skip the grace)
+const lapsed = new Map<string, boolean>()
+// Tasks the engine's notice has said ended, so a result that names one afterwards (the notice was drawn first) does not hold
+const noticed = new Set<string>()
+// What a notice's `task.status` says of a task that ended (stopped is `killed`); any other word is not taken as an ending
+const ENDED = new Set(['completed', 'failed', 'killed'])
+// For BACKGROUND_HOLD_MS after a background start the engine did not name (or when it sends no list): no ad shown or counted. One
+// window per start, each ending by its own timer; no call's end, agent's end or turn's end clears one
+let windowSeq = 0
+const windows = new Map<number, { cancel: () => void }>()
+// What the holds cost, for /ads status: slots a command cut short, and the time any command (or the window) held ads back
+let cutShort = 0
+let heldMs = 0
+let heldSince: number | null = null
+// Anything that keeps an ad off the screen: a dialog, a running command, a tracked background command, the window after a background
+// start. Every place that asks whether an ad may show or start reads this, never one of the maps, or a hold would silently not apply there.
+const onHold = () => pendingAsks.size > 0 || commandHolds.size > 0 || bgTasks.size > 0 || windows.size > 0
 let restored = false
 // Saves run one after another, each writing the newest map, so a slow write can't land over a newer one
 let saving: Promise<unknown> = Promise.resolve()
@@ -152,7 +193,7 @@ function unhide($: EngineInterface, keys: string[]) {
   for (const k of keys) removed = pendingAsks.delete(k) || removed
   if (!removed) return
   saveDialogs($)
-  if (pendingAsks.size === 0 && turns.size > 0) void startSlot($)
+  if (!onHold() && turns.size > 0) void startSlot($)
 }
 // An MCP question that won't show (blocked, or its hooks failed): its marker and its place in the queue go
 function closeQuestion($: EngineInterface, where: string, key: string) {
@@ -173,6 +214,121 @@ function forgetOwner($: EngineInterface, owner: string) {
   if (removed) saveDialogs($)
   for (const [k, a] of asked) if (a.owner === owner) asked.delete(k)
   for (const [k, o] of callOwner) if (o === owner) callOwner.delete(k)
+  let freed = false
+  for (const [k, o] of commandHolds) if (o === owner && commandHolds.delete(k)) freed = true
+  if (freed) tallyHeld($)
+}
+// A command starts: the ad on screen is void (it goes back to the cache for a fresh 5 seconds), and none starts until it ends.
+// A startSlot waiting on the clock needs no nudge: it checks onHold() when it resumes, and a command that has ended by then
+// started a newer one.
+function holdCommand($: EngineInterface, hold: string, owner: string) {
+  commandHolds.set(hold, owner)
+  if (slot) {
+    if (slot.timer) cutShort++
+    dropSlot(true)
+    $.ui.invalidate('ui.render')
+  }
+  tallyHeld($)
+}
+function releaseCommand($: EngineInterface, hold: string) {
+  if (!commandHolds.delete(hold)) return
+  tallyHeld($)
+  if (!onHold() && turns.size > 0) void startSlot($)
+}
+// A background start the engine did not name opens a window of its own; it ends by itself, whatever else ends
+function openWindow($: EngineInterface) {
+  const w = ++windowSeq
+  windows.set(
+    w,
+    $.clock.after(BACKGROUND_HOLD_MS, () => {
+      windows.delete(w)
+      tallyHeld($)
+      if (!onHold() && turns.size > 0 && !slot) void startSlot($)
+    }),
+  )
+  return w
+}
+// The start turned out to be named by the engine: the task holds, so this start's window is not needed. Only its own
+function closeWindow(w: number) {
+  windows.get(w)?.cancel()
+  windows.delete(w)
+}
+// The name the engine gave a command that went to the background: a Bash result's `backgroundTaskId`, a Monitor result's `taskId`
+function taskIdOf(tool: string, result: unknown) {
+  const out = (result as { result?: unknown } | undefined)?.result
+  if (typeof out !== 'object' || out === null) return null
+  const id = (out as Record<string, unknown>)[tool === 'Monitor' ? 'taskId' : 'backgroundTaskId']
+  return typeof id === 'string' && id !== '' ? id : null
+}
+// The ids of a Stop snapshot's `background_tasks`, or null when it is not a list this Mod can read (absent is not empty)
+function runningIn(list: unknown) {
+  if (!Array.isArray(list)) return null
+  const ids = new Set<string>()
+  for (const t of list) {
+    const id = (t as { id?: unknown } | null)?.id
+    if (typeof id !== 'string') return null
+    ids.add(id)
+  }
+  return ids
+}
+// A tracked task ended, by the engine's word: ads may start again once nothing else holds
+function freeTasks($: EngineInterface, ended: string[]) {
+  let freed = false
+  for (const id of ended) {
+    lapsed.delete(id)
+    freed = bgTasks.delete(id) || freed
+  }
+  if (!freed) return
+  tallyHeld($)
+  if (!onHold() && turns.size > 0) void startSlot($)
+}
+// A Stop (main loop or subagent) lists what the session still runs. A tracked task it no longer lists has ended, once the task is
+// old enough for that to count. A list this Mod cannot read says nothing of any task. On an engine that has never sent a readable
+// list, the main loop's Stop hands what is tracked to the old window, from now (the engine cannot say when they end); once any
+// list has been read, a Stop without one is ignored, as is a subagent's.
+function settleTasks($: EngineInterface, list: unknown, main: boolean) {
+  const running = runningIn(list)
+  if (running !== null) {
+    listSeen = true
+    // The engine's list still shows a task the window was holding: tracked again, and what is on screen is void. One it does not
+    // show is forgotten, once old enough for that to count
+    const back = [...lapsed].filter(([id]) => running.has(id))
+    for (const [id, old] of [...lapsed]) if (old || running.has(id)) lapsed.delete(id)
+    for (const [id, old] of back) bgTasks.set(id, old)
+    if (back.length > 0) {
+      if (slot) {
+        dropSlot(true)
+        $.ui.invalidate('ui.render')
+      }
+      tallyHeld($)
+    }
+  }
+  if (bgTasks.size === 0) return
+  if (running !== null) return freeTasks($, [...bgTasks].filter(([id, old]) => old && !running.has(id)).map(([id]) => id))
+  if (!main || listSeen) return
+  openWindow($)
+  for (const [id, old] of bgTasks) lapsed.set(id, old)
+  bgTasks.clear()
+}
+// What a Bash result says of a command that went on running after its call returned (the engine's Bash output). Any of its
+// signs counts, and so does an unexpected shape: not recognised as background means a window is missed, so each is checked.
+function wentToBackground(result: unknown) {
+  const out = (result as { result?: unknown } | undefined)?.result
+  if (typeof out !== 'object' || out === null) return false
+  const o = out as Record<string, unknown>
+  return !!(o.backgroundTaskId || o.backgroundedByUser || o.backgroundedByTurnAbort || o.backgroundedToDeliverMessage || o.timedOutAfterMs != null)
+}
+// Time with any command hold in force, for /ads status. ponytail: approximate (the clock is read a moment after each change);
+// it counts the window's whole 120 s even when Claude is idle in it
+function tallyHeld($: EngineInterface) {
+  void $.clock.now().then((t) => {
+    const holding = commandHolds.size > 0 || bgTasks.size > 0 || windows.size > 0
+    if (holding && heldSince === null) heldSince = t
+    else if (!holding && heldSince !== null) {
+      heldMs += t - heldSince
+      heldSince = null
+    }
+  })
 }
 let slot: Slot | null = null
 // Cells left for the ad text at the last spinner draw (null = not measured yet). ponytail: one value for the session;
@@ -299,10 +455,14 @@ let compatNoticeShown = false
 let pausedNoticeShown = false
 // Dialogs saved as open by an earlier load (or saved state that can't be read): no ads until Claude Code restarts
 let offForSession = false
+// B4: this load wrote the session's "started" marker and the write landed. Until then no ad can be shown.
+let started = false
+let claim: Promise<void> | null = null
+const STARTED = { plugin: 'spinsponsor', key: 'started' } as const
 const engineOk = () => versionAtLeast(engineBase, MIN_ENGINE) && !blockedEngines.includes(engineBase!) && !unexpectedProps
 
 const signedIn = () => key !== '' && !authFailed && !loggedOut
-const active = () => signedIn() && !paused && refusal === null && engineOk() && !offForSession
+const active = () => signedIn() && !paused && refusal === null && engineOk() && !offForSession && started
 const headers = () => ({ authorization: `Bearer ${key}`, 'content-type': 'application/json', 'x-client-version': VERSION })
 const nextBackoff = () => Math.min(MAX_BACKOFF_MS, Math.max(MIN_BACKOFF_MS, backoffMs * 2))
 
@@ -393,7 +553,7 @@ async function refill($: EngineInterface) {
       })
     }
   }
-  if (landed && turns.size > 0 && !slot && pendingAsks.size === 0) await startSlot($)
+  if (landed && turns.size > 0 && !slot && !onHold()) await startSlot($)
 }
 
 async function saveQueue($: EngineInterface) {
@@ -473,7 +633,7 @@ async function prune($: EngineInterface) {
       slot = null
       gen++
       $.ui.invalidate('ui.render')
-      if (turns.size > 0 && pendingAsks.size === 0) await startSlot($)
+      if (turns.size > 0 && !onHold()) await startSlot($)
     }
   } catch {
     // The next minute's check tries again
@@ -524,7 +684,7 @@ function reconsider($: EngineInterface) {
     return
   }
   dropSlot(true)
-  if (turns.size > 0 && pendingAsks.size === 0) void startSlot($)
+  if (turns.size > 0 && !onHold()) void startSlot($)
 }
 
 // Queue the next ad; its 5 seconds start when the spinner first draws it
@@ -534,7 +694,7 @@ async function startSlot($: EngineInterface) {
   if (!active()) return
   const now = await $.clock.now()
   // Anything may have happened during the await: pause, logout, turn end, a prompt, or a newer slot
-  if (mine !== gen || !active() || turns.size === 0 || pendingAsks.size > 0) return
+  if (mine !== gen || !active() || turns.size === 0 || onHold()) return
   cache = cache.filter((a) => a.expiresAt - now > SLOT_MS * 2)
   // The first ad this screen can draw, and its format with it; one too big waits for a bigger screen instead of blocking
   // the rest. With none, take no slot (the stock spinner shows); a bigger screen or new ads start one from a render hook.
@@ -557,7 +717,7 @@ function armSlot($: EngineInterface, s: Slot) {
     if (slot !== s) return
     slot = null
     s.timer = null
-    if (s.clean && active() && pendingAsks.size === 0 && s.shownAt !== null) {
+    if (s.clean && active() && !onHold() && s.shownAt !== null) {
       impressions++
       void enqueue($, { clientEventId: crypto.randomUUID(), deliveryToken: s.ad.deliveryToken, shownAt: new Date(s.shownAt).toISOString(), durationMs: SLOT_MS, format: s.format })
     } else {
@@ -567,7 +727,7 @@ function armSlot($: EngineInterface, s: Slot) {
   })
 }
 
-function statusText() {
+function statusText(now: number) {
   const sync = lastSync === null ? 'never' : new Date(lastSync).toISOString().slice(11, 19) + ' UTC'
   const state =
     key === '' ? 'not signed in (see /ads login)'
@@ -593,6 +753,8 @@ function statusText() {
     `· last spinner: ${lastSurface || 'not drawn yet'}${lastSurface ? (room === null ? ', width not reported' : `, ${room} cells for the ad`) : ''}`,
     `· last band: ${band ? `${band.surface}, ${band.bodyColumns} columns × ${band.maxRows} rows${band.hasSurvey ? ', survey' : ''}${band.working ? ', working' : ''}` : 'not drawn yet'}`,
     `· ad now: ${slot ? `${slot.format}, ${slot.timer ? 'on screen' : 'waiting to draw'}` : 'none'}${pendingAsks.size > 0 ? ` · dialogs open: ${pendingAsks.size}` : ''}`,
+    // What the command holds cost on this machine: the figure to judge them by (docs/SANDBOX-PROMPT-VIEWS-PLAN.md)
+    `· commands running: ${commandHolds.size} · held back by commands: ${Math.round((heldMs + (heldSince === null ? 0 : now - heldSince)) / 1000)} s · ad slots cut short: ${cutShort} · background commands tracked: ${bgTasks.size}${windows.size > 0 ? ' · background window open' : ''}`,
     `· render p95 ${p95(renderMs).toFixed(2)} ms`,
   ].join(' ')
 }
@@ -605,15 +767,39 @@ function boot($: EngineInterface) {
   return booting
 }
 
+// B4: the first load of a Claude Code session writes this marker and shows ads only once the write has landed. A load that finds it is
+// a reload, and the engine gives no barrier (a dialog may have opened that this load never heard of), so ads stay off until Claude
+// Code restarts, which starts with empty state. A read that fails, a write that fails, is refused (another load got there first;
+// the write is conditional on the marker never having been written) or takes longer than MARKER_WAIT_MS counts as a reload too:
+// it can't be told apart, and off only costs earnings.
+async function claimSession($: EngineInterface) {
+  const settled = new AbortController()
+  const deadline = $.clock.sleep(MARKER_WAIT_MS, { signal: settled.signal }).then(() => false, () => false)
+  const write = (async () => {
+    const { value, version } = await $.state.get(STARTED)
+    if (value !== undefined || version !== 0) return false
+    return (await $.state.set(STARTED, true, { ifVersion: 0 })).isSet
+  })().catch(() => false)
+  try {
+    started = await Promise.race([write, deadline])
+  } finally {
+    settled.abort()
+  }
+  if (!started) offForSession = true
+}
+
 async function startup($: EngineInterface) {
   paused = (await $.store.get('paused')) === true
   // Dialogs still open before a reload of this Mod: their close events can't be matched any more, and one may stay open
   // past any turn's end, so ads stay off until Claude Code restarts (which starts with empty state). So does a failed
   // read: it can't rule them out. Nothing is saved while off, so a later reload finds the same map and stays off too.
+  // So does anything saved at all (version above 0): every load since 0.2.27 saves a map when it starts, so an earlier
+  // load ran in this session, even an empty map from a Mod too old to write the "started" marker (Codex review: 0.2.35
+  // knows nothing of background commands, so reloading into this one must not turn ads on).
   if (!restored && !offForSession) {
     try {
-      const { value } = await $.state.get(DIALOGS)
-      offForSession = !!value && typeof value === 'object' && Object.keys(value).length > 0
+      const { version } = await $.state.get(DIALOGS)
+      offForSession = version !== 0
     } catch {
       offForSession = true
       // Written down, so a later reload (with the read working again) stays off too (Codex review of 0.2.28)
@@ -625,6 +811,8 @@ async function startup($: EngineInterface) {
       saveDialogs($)
     }
   }
+  // Once per loaded module, even if a failed startup is retried: its own marker must not read as an earlier load's
+  if (!offForSession) await (claim ??= claimSession($))
   // Checked at start-up and on every reload (each reload runs this again)
   try {
     const v = await $.session.version()
@@ -747,7 +935,7 @@ async function checkPermission($: EngineInterface) {
     })
     if (was !== null) {
       await refill($)
-      if (turns.size > 0 && !slot && pendingAsks.size === 0) await startSlot($)
+      if (turns.size > 0 && !slot && !onHold()) await startSlot($)
     }
   } catch {
     // Offline: the permission runs out on its own
@@ -876,7 +1064,7 @@ export const register: Register = (on, options) => {
   on('turn.complete', async ($, e, next) => {
     if (e.agentId) {
       forgetOwner($, e.agentId)
-      if (pendingAsks.size === 0 && turns.size > 0 && !slot) void startSlot($)
+      if (!onHold() && turns.size > 0 && !slot) void startSlot($)
       return next(e)
     }
     turns.delete(e.turnId)
@@ -953,14 +1141,41 @@ export const register: Register = (on, options) => {
     return next(e)
   })
 
-  // AskUserQuestion also hides the spinner; when the last prompt or question closes, queue a fresh slot
+  // AskUserQuestion also hides the spinner; when the last prompt or question closes, queue a fresh slot. A Bash or Monitor call
+  // holds ads from here to its end whatever the engine decided about it: a sandboxed command is allowed with no dialog, and the
+  // sandbox's network prompt gives this Mod no signal (so this can't wait for one, and never reads `asked`).
   on('tool.call', async ($, e, next) => {
     const id = e.tool_use_id
-    if (id) callOwner.set(id, ownerOf(e.agentId))
-    if (e.tool === 'AskUserQuestion' && id) hideFor($, [id], ownerOf(e.agentId))
+    const owner = ownerOf(e.agentId)
+    if (id) callOwner.set(id, owner)
+    if (e.tool === 'AskUserQuestion' && id) hideFor($, [id], owner)
+    // A call without an id still holds (under a marker of its own)
+    const command = e.tool === 'Bash' || e.tool === 'Monitor' ? (id ?? `cmd:${++blockerSeq}`) : null
+    let startWindow: number | null = null
+    if (command) {
+      holdCommand($, command, owner)
+      // Left running in the background: a window of its own until the result says whether the engine names it. Monitor always is.
+      if (e.tool === 'Monitor' || (e.tool === 'Bash' && !!e.run_in_background)) startWindow = openWindow($)
+    }
     try {
-      return await next(e)
+      const result = await next(e)
+      if (command) {
+        // The engine names a command it tracks, however it came to run in the background (run_in_background, Ctrl+B, its timeout...):
+        // it holds until the engine says it ended, and the start's window is not needed. A foreground Bash can also end up in the
+        // background with no name: the call returns while the process lives on, and its result is the only sign. Either is in place
+        // before the finally below lets the command's own hold go, so ads are never free in between (Codex review, round 2).
+        const task = taskIdOf(e.tool, result)
+        if (task !== null) {
+          if (!noticed.has(task)) {
+            bgTasks.set(task, false)
+            void $.clock.after(SNAPSHOT_GRACE_MS, () => (bgTasks.has(task) ? bgTasks.set(task, true) : lapsed.has(task) && lapsed.set(task, true)))
+          }
+          if (startWindow !== null) closeWindow(startWindow)
+        } else if (startWindow === null && wentToBackground(result)) openWindow($)
+      }
+      return result
     } finally {
+      if (command) releaseCommand($, command)
       if (id) {
         asked.delete(id)
         callOwner.delete(id)
@@ -973,6 +1188,27 @@ export const register: Register = (on, options) => {
         unhide($, closed)
       }
     }
+  })
+
+  // What the session still runs, at the end of a turn (and of a subagent's): a tracked background command no longer listed has ended
+  on('classic.Stop', async ($, e, next) => {
+    settleTasks($, e.background_tasks, true)
+    return next(e)
+  })
+  on('classic.SubagentStop', async ($, e, next) => {
+    settleTasks($, e.background_tasks, false)
+    return next(e)
+  })
+
+  // A background task's completion notice: a faster word than the next Stop that it ended (the wake-up turn draws it as it starts).
+  // Only the engine's own notification rows, and only an ending: a task is not released on any other draw.
+  on('ui.render', { component: 'UserMessage' }, async ($, e, next) => {
+    const task = e.props?.task
+    if (e.props?.origin?.kind === 'task-notification' && task?.id && ENDED.has(task.status ?? '')) {
+      noticed.add(task.id)
+      freeTasks($, [task.id])
+    }
+    return next(e)
   })
 
   on('ui.render', { component: 'Spinner' }, async ($, e, next) => {
@@ -992,14 +1228,14 @@ export const register: Register = (on, options) => {
     }
     const s = slot
     // No slot (nothing fitted before), but the screen is wider now or new ads fit: start one
-    if (drawn && !s && active() && turns.size > 0 && pendingAsks.size === 0 && room !== null && cache.some((a) => fitsIn(a))) void startSlot($)
+    if (drawn && !s && active() && turns.size > 0 && !onHold() && room !== null && cache.some((a) => fitsIn(a))) void startSlot($)
     // A card is the band's: this hook leaves it alone (the stock spinner shows beside it)
     if (drawn && s && active() && s.format === 'line') {
       text = PREFIX + s.ad.text
       // Unmeasured width fails closed
       const fits = fitsIn(s.ad)
-      if (e.props.message !== null || !fits || pendingAsks.size > 0) {
-        // The engine's status, a narrow screen or a prompt replaces the ad: a slot already on screen is void
+      if (e.props.message !== null || !fits || onHold()) {
+        // The engine's status, a narrow screen, a prompt or a running command replaces the ad: a slot already on screen is void
         if (s.timer) s.clean = false
         text = null
       } else {
@@ -1038,11 +1274,11 @@ export const register: Register = (on, options) => {
     if (changed) reconsider($)
     const s = slot
     // No slot (nothing fitted before), but the card fits now: start one
-    if (!s && active() && turns.size > 0 && pendingAsks.size === 0 && cache.some((a) => cardFits(a))) void startSlot($)
+    if (!s && active() && turns.size > 0 && !onHold() && cache.some((a) => cardFits(a))) void startSlot($)
     // A line is the spinner's: this hook leaves it alone
     if (!s || !active() || s.format !== 'card') return next(e)
     // Idle, a survey, a permission prompt or too small: no card, and a running one can't count
-    if (!e.props.isWorking || pendingAsks.size > 0 || !cardFits(s.ad)) {
+    if (!e.props.isWorking || onHold() || !cardFits(s.ad)) {
       if (s.timer) s.clean = false
       return next(e)
     }
@@ -1119,7 +1355,7 @@ export const register: Register = (on, options) => {
       }
       return { text: 'SpinSponsor signed out for this session and cleared its cached ads and unsent views. To stay signed out, run /plugin configure spinsponsor@spinsponsor and empty "Install key".' }
     }
-    return { text: statusText() }
+    return { text: statusText(await $.clock.now()) }
   })
 
   // Draws the clickable link for /ads open on screen only

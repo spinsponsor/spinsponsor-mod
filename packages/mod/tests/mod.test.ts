@@ -1,5 +1,5 @@
 import { expect, mock, test } from 'claude-code/testing'
-import { allowedApi, bandPropsOk, cardRows, cells, FETCH_GAP_MS, FLUSH_EVERY_MS, LINK_POLL_MS, OPEN_TEXT, p95, PERMIT_MS, RECHECK_MS, REQUEST_TIMEOUT_MS, SLOT_MS, toAd, versionAtLeast, wrapRows } from '../hooks/register'
+import { allowedApi, BACKGROUND_HOLD_MS, bandPropsOk, cardRows, cells, FETCH_GAP_MS, FLUSH_EVERY_MS, LINK_POLL_MS, MARKER_WAIT_MS, OPEN_TEXT, p95, PERMIT_MS, RECHECK_MS, REQUEST_TIMEOUT_MS, SLOT_MS, SNAPSHOT_GRACE_MS, toAd, versionAtLeast, wrapRows } from '../hooks/register'
 
 const KEY = { install_key: 'ss_test', api_url: 'http://localhost:8787' }
 const SPINNER = {
@@ -40,14 +40,14 @@ const serverAd = (n: number, text = `Ad number ${n}`, card: Record<string, unkno
   ...card,
 })
 
-type Opts = { slowFirstStateSetMs?: number; stateGetFails?: boolean; firstStateSetFails?: boolean; hookAnswersDialog?: boolean; loopCheckAllows?: boolean; answerCommand?: string; dialogHookMs?: number; toolMs?: number; dialogs?: Record<string, string>; ads?: unknown[]; perFetch?: (n: number) => unknown[]; adsDelayMs?: number; adsStatuses?: number[]; eventsStatus?: number; stored?: Record<string, unknown>; slowAds?: boolean; stopped?: string[]; renderThrows?: boolean; adsRejects?: string; engine?: string | null; permission?: { serve?: boolean; reason?: string; blocked?: string[]; status?: number; slowMs?: number; rejects?: string }; link?: { approved: boolean; claimStatus?: number; slowClaimMs?: number }; slowSaveMs?: number; term?: string; ssh?: boolean; openExit?: number }
+type Opts = { toolResult?: unknown; resultFor?: (e: { tool: string; tool_use_id?: string; run_in_background?: boolean }) => unknown; check?: 'ask' | 'allow'; loopCheckAllows?: boolean; started?: boolean; markerSetMs?: number; markerSetFails?: boolean; markerRace?: boolean; toolThrows?: boolean; toolDenies?: boolean; slowFirstStateSetMs?: number; stateGetFails?: boolean; firstStateSetFails?: boolean; hookAnswersDialog?: boolean; answerCommand?: string; dialogHookMs?: number; toolMs?: number; dialogs?: Record<string, string>; ads?: unknown[]; perFetch?: (n: number) => unknown[]; adsDelayMs?: number; adsStatuses?: number[]; eventsStatus?: number; stored?: Record<string, unknown>; slowAds?: boolean; stopped?: string[]; renderThrows?: boolean; adsRejects?: string; engine?: string | null; permission?: { serve?: boolean; reason?: string; blocked?: string[]; status?: number; slowMs?: number; rejects?: string }; link?: { approved: boolean; claimStatus?: number; slowClaimMs?: number }; slowSaveMs?: number; term?: string; ssh?: boolean; openExit?: number }
 const ISO = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
 
 // Stubs Claude Code and a fake SpinSponsor API that enforces the real contract; returns what the mod sent and drew
 function engine(on: Parameters<Parameters<typeof test>[1]>[1], o: Opts = {}) {
   const clock = mock.clock(on, { now: Date.parse('2026-10-04T12:00:00Z') })
-  const seen = { invalidations: 0, message: null as string | null, fetches: [] as string[], auth: [] as string[], toasts: [] as string[], opened: [] as string[][], events: [] as { deliveryToken: string; durationMs: number }[], bad: [] as string[] }
+  const seen = { invalidations: 0, message: null as string | null, fetches: [] as string[], auth: [] as string[], toasts: [] as string[], opened: [] as string[][], events: [] as { deliveryToken: string; durationMs: number }[], bad: [] as string[], stops: [] as string[] }
   const store = new Map<string, unknown>(Object.entries(o.stored ?? {}))
   const issued = new Set<string>()
   const accepted = new Set<string>()
@@ -85,10 +85,11 @@ function engine(on: Parameters<Parameters<typeof test>[1]>[1], o: Opts = {}) {
   on('session.start', () => ({ cwd: '/work' }))
   on('turn.start', ($, e) => ({ turnId: e.turnId }))
   on('turn.complete', () => ({ text: '' }))
+  // What the engine's decider says about a call: ask, or (a sandboxed command, an auto-approved tool) allow (o.check).
   // o.loopCheckAllows: a check raised inside a subagent's call (it carries the agent's id) passes, as an earlier
   // allow would. Since 2.1.309 the kit's $.tool.call raises that check itself and refuses an ask no hook answers,
   // so a test that opens the call's dialog by hand needs it to pass (a $.tool.check query carries no agent)
-  on('tool.check', ($, e) => ({ decision: o.loopCheckAllows && e.agentId ? 'allow' : 'ask' }))
+  on('tool.check', ($, e) => ({ decision: o.loopCheckAllows && e.agentId ? 'allow' : (o.check ?? 'ask') }))
   // Bottom of the PermissionRequest hooks: nobody answers, so the dialog opens (unless a settings hook allows it)
   on('classic.PermissionRequest', async ($, e) => {
     if (o.dialogHookMs) await clock.sleep(o.dialogHookMs)
@@ -97,20 +98,40 @@ function engine(on: Parameters<Parameters<typeof test>[1]>[1], o: Opts = {}) {
   })
   on('classic.Elicitation', ($, e) => (e.message === 'blocked' ? { block: 'not allowed' } : {}))
   on('classic.ElicitationResult', () => ({}))
-  on('tool.call', async () => {
+  on('tool.call', async ($, e) => {
     if (o.toolMs) await clock.sleep(o.toolMs)
-    return { result: 'ok' }
+    if (o.toolThrows) throw new Error('tool failed')
+    if (o.toolDenies) return { deny: 'refused' }
+    return { result: o.resultFor ? o.resultFor(e) : (o.toolResult ?? 'ok') }
   })
+  // Bottom of the Stop hooks: nobody blocks the stop. What each carried is kept for the tests that check the Mod passes it on
+  on('classic.Stop', ($, e) => (seen.stops.push('main'), {}))
+  on('classic.SubagentStop', ($, e) => (seen.stops.push(e.agent_id), {}))
   // The session's state ($.state): open dialogs saved there survive a reload (o.dialogs: what an earlier load left)
-  const state = new Map<string, unknown>(o.dialogs ? [['dialogs', o.dialogs]] : [])
+  // (o.started: the "session started" marker an earlier load wrote, so this load is a reload)
+  const state = new Map<string, unknown>([...(o.dialogs ? [['dialogs', o.dialogs] as const] : []), ...(o.started ? [['started', true] as const] : [])])
   on('state.get', ($, e) => {
     if (o.stateGetFails) return { deny: 'state unavailable' }
     return { value: { value: state.get(e.key), version: state.has(e.key) ? 1 : 0 } }
   })
-  let stateSets = 0
+  // The first-save knobs are for the dialogs' save; the session marker has its own (o.markerSetMs, o.markerSetFails)
+  let dialogSets = 0
+  // What each write of the session marker asked for (a conditional write: only while it was never written)
+  const markerWrites: (number | undefined)[] = []
   on('state.set', async ($, e) => {
-    if (stateSets++ === 0 && o.slowFirstStateSetMs) await clock.sleep(o.slowFirstStateSetMs)
-    if (stateSets === 1 && o.firstStateSetFails) return { deny: 'state unavailable' }
+    if (e.key === 'dialogs' && dialogSets++ === 0) {
+      if (o.slowFirstStateSetMs) await clock.sleep(o.slowFirstStateSetMs)
+      if (o.firstStateSetFails) return { deny: 'state unavailable' }
+    }
+    if (e.key === 'started') {
+      markerWrites.push(e.ifVersion)
+      if (o.markerSetMs) await clock.sleep(o.markerSetMs)
+      if (o.markerSetFails) return { deny: 'state unavailable' }
+      // Another load wrote it between this one's read and its write
+      if (o.markerRace) return { value: { isSet: false, version: 1 } }
+    }
+    // A conditional write lands only while the value stands at that version (0: never written)
+    if (e.ifVersion !== undefined && e.ifVersion !== (state.has(e.key) ? 1 : 0)) return { value: { isSet: false, version: 1 } }
     state.set(e.key, e.value)
     return { value: { isSet: true, version: 1 } }
   })
@@ -175,7 +196,7 @@ function engine(on: Parameters<Parameters<typeof test>[1]>[1], o: Opts = {}) {
     if (e.component === 'Spinner') seen.message = e.props.message
     return { type: 'Text', props: {}, children: [String(e.props.text ?? e.props.message)] }
   })
-  return { clock, seen, store, issued, state }
+  return { clock, seen, store, issued, state, markerWrites }
 }
 // A permission dialog: the call needs asking, then its dialog opens
 const dialog = async ($: any, id = 'u1') => {
@@ -1799,13 +1820,16 @@ test('the ad is hidden as soon as a permission request starts, even while slow h
   await clock.advance(2000)
   // The dialog opens while the PermissionRequest hooks are still running (4 s)
   await $.tool.check({ tool: 'Bash', input: { command: 'rm x' }, tool_use_id: 'u1' })
-  void $.classic.PermissionRequest({ tool_name: 'Bash', tool_input: { command: 'rm x' } })
+  void $.classic.PermissionRequest({ tool_name: 'Bash', tool_input: { command: 'rm x' } }).catch(() => {})
   await clock.advance(3000)
   // The ad that was on screen 2 s before never counts
   expect(queued(store)).toEqual([])
   await spin($)
   expect(seen.message).toBe(null)
   expect(await ads($, 'status')).toContain('dialogs open: 1')
+  // The request's slow hook ends inside the test, not after it (a request still running at the end made the suite fail on a loaded machine)
+  await clock.advance(1000)
+  await clock.settle()
 })
 
 test('an MCP server’s question hides the ad until it is answered; the ad then starts afresh', { options: KEY }, async ($, on) => {
@@ -2043,4 +2067,1090 @@ test('the "restart" message is never swallowed by another message, and status na
   await clock.advance(LINK_POLL_MS)
   expect(seen.toasts.filter((t) => t.includes('Restart Claude Code')).length).toBe(1)
   expect(await ads($, 'status')).toContain('restart Claude Code to see ads again')
+})
+
+// --- Commands: no ad is shown or counted while Claude runs one (docs/SANDBOX-PROMPT-VIEWS-PLAN.md) ---
+// Claude Code gives a Mod no signal for a sandbox network prompt, which covers the ad while a command runs. So a Bash or Monitor
+// call holds ads from its tool.call to its end (a sandboxed command is `allow`, with no dialog: the hold cannot wait for one), and a
+// command left running in the background holds them for BACKGROUND_HOLD_MS after it starts. Every test goes through $.tool.call.
+const run = ($: any, id: string, o: Record<string, unknown> = {}) => $.tool.call({ tool: 'Bash', command: 'curl -sI https://example.org', tool_use_id: id, ...o } as any)
+const background = ($: any, id: string, o: Record<string, unknown> = {}) => run($, id, { run_in_background: true, ...o })
+const watch = ($: any, id: string) => $.tool.call({ tool: 'Monitor', command: 'tail -f log', description: 'watch', timeout_ms: 60_000, tool_use_id: id } as any)
+// A command's whole run, from start to answer
+const during = async (clock: { advance: (ms: number) => Promise<unknown> }, call: Promise<unknown>, ms: number) => {
+  await clock.advance(ms)
+  await call
+}
+const finished = ($: any, agentId: string) => $.turn.complete({ turnId: `${agentId}-turn`, agentId, answer: '', durationMs: 1, isAborted: false, reason: 'answer', usage: null })
+const cmdStatus = async ($: any) => (await ads($, 'status')).match(/commands running: \d+ · held back by commands: \d+ s · ad slots cut short: \d+/)?.[0]
+
+test('a command that starts while an ad is on screen voids it; after the call the ad starts afresh and counts once', { options: KEY }, async ($, on) => {
+  const { clock, seen, store } = engine(on, { ads: MANY, check: 'allow', toolMs: 8000 })
+  await start($)
+  await $.turn.start({ text: 'hi', turnId: 't1' })
+  await spin($)
+  expect(seen.message).toBe(line(surface, 'Ad number 1'))
+  await clock.advance(2000)
+  const call = run($, 'c1')
+  await clock.advance(SLOT_MS)
+  await spin($)
+  expect(seen.message).toBe(null)
+  expect(queued(store)).toEqual([])
+  await during(clock, call, 3000)
+  await spin($)
+  // The ad cut short comes back, afresh: nothing at 4,999 ms, one view at 5,000
+  expect(seen.message).toBe(line(surface, 'Ad number 1'))
+  await clock.advance(SLOT_MS - 1)
+  expect(queued(store)).toEqual([])
+  await clock.advance(1)
+  expect(queued(store).length).toBe(1)
+  await done($)
+  await clock.advance(FLUSH_EVERY_MS)
+  expect(seen.events.length).toBe(1)
+  expect(seen.bad).toEqual([])
+})
+
+test('a short command ends before the slot would; with nothing redrawing, only the hold can stop that view', { options: KEY }, async ($, on) => {
+  // Nothing redraws after the unmount, so no render hook can void the slot and the timer's own check sees no command
+  // at second 5: only the hold's own voiding (at second 2) stands between this slot and a billed view
+  const { clock, seen, store } = engine(on, { ads: MANY, check: 'allow', toolMs: 1000 })
+  await start($)
+  await $.turn.start({ text: 'hi', turnId: 't1' })
+  const ui = await spin($)
+  await ui.unmount()
+  await clock.advance(2000)
+  const call = run($, 'c1')
+  await during(clock, call, 1000)
+  await clock.advance(SLOT_MS * 2)
+  expect(queued(store)).toEqual([])
+  await done($)
+  await clock.advance(FLUSH_EVERY_MS)
+  expect(seen.events).toEqual([])
+})
+
+// startSlot waits on a clock read before it takes an ad. A wildcard hook holds that read back (the kit's own clock owns clock.now),
+// as a busy engine could, so a command can start, and end, while it is suspended.
+function gatedClock(on: Parameters<Parameters<typeof test>[1]>[1]) {
+  let open!: () => void
+  const gate = new Promise<void>((r) => (open = r))
+  let closed = false
+  on('*', async ($, e, next) => {
+    if (closed && next.is('clock.now', e)) await gate
+    return next(e)
+  })
+  return { close: () => (closed = true), open }
+}
+const adNow = async ($: any) => (await ads($, 'status')).match(/ad now: [^·]*/)?.[0].trim()
+
+test('a command that starts while the next ad is being queued, and is still running when that resumes: no slot is taken', { options: KEY }, async ($, on) => {
+  const { clock, seen, store } = engine(on, { ads: MANY, check: 'allow', toolMs: 3000 })
+  const g = gatedClock(on)
+  await start($)
+  // Startup's own permission check and ad fetch finish first: with them held back too, startSlot would return before its clock read
+  await clock.settle()
+  g.close()
+  await $.turn.start({ text: 'hi', turnId: 't1' })
+  const call = run($, 'c1')
+  await clock.advance(1000)
+  g.open()
+  await clock.settle()
+  // The suspended startSlot has resumed into a running command: nothing is queued, nothing drawn
+  expect(await adNow($)).toBe('ad now: none')
+  await spin($)
+  expect(seen.message).toBe(null)
+  await during(clock, call, 2000)
+  await spin($)
+  expect(seen.message).toBe(line(surface, 'Ad number 1'))
+  await clock.advance(SLOT_MS)
+  expect(queued(store).length).toBe(1)
+})
+
+test('a command that starts and ends while the next ad is being queued: one slot afterwards, counted once', { options: KEY }, async ($, on) => {
+  const { clock, seen, store } = engine(on, { ads: MANY, check: 'allow', toolMs: 1000 })
+  const g = gatedClock(on)
+  await start($)
+  // Startup's own permission check and ad fetch finish first: with them held back too, startSlot would return before its clock read
+  await clock.settle()
+  g.close()
+  await $.turn.start({ text: 'hi', turnId: 't1' })
+  const call = run($, 'c1')
+  await during(clock, call, 1000)
+  // Both the turn's and the command's end's waiting reads resume now; only the newer may take an ad
+  g.open()
+  await clock.settle()
+  expect(await adNow($)).toBe('ad now: line, waiting to draw')
+  await spin($)
+  expect(seen.message).toBe(line(surface, 'Ad number 1'))
+  await clock.advance(SLOT_MS)
+  expect(queued(store).length).toBe(1)
+  await done($)
+  await clock.advance(FLUSH_EVERY_MS)
+  expect(seen.events.map((e: any) => e.deliveryToken)).toEqual([token(1)])
+})
+
+for (const order of ['the dialog first', 'the command first'] as const) test(`a dialog and a command overlap: the ad returns only when both are gone (${order})`, { options: KEY }, async ($, on) => {
+  const { clock, seen } = engine(on, { ads: MANY, check: 'allow', toolMs: 4000 })
+  await start($)
+  await $.turn.start({ text: 'hi', turnId: 't1' })
+  await spin($)
+  await clock.advance(1000)
+  const call = run($, 'c1')
+  await clock.advance(1000)
+  await $.classic.Elicitation({ mcp_server_name: 'hf', message: 'Which repo?', elicitation_id: 'e1' })
+  const answer = () => $.classic.ElicitationResult({ mcp_server_name: 'hf', elicitation_id: 'e1', action: 'accept' })
+  if (order === 'the dialog first') {
+    await answer()
+    await spin($)
+    expect(seen.message).toBe(null)
+    await during(clock, call, 4000)
+  } else {
+    await during(clock, call, 4000)
+    await spin($)
+    expect(seen.message).toBe(null)
+    await answer()
+  }
+  await spin($)
+  expect(seen.message).toContain('Sponsored: ')
+})
+
+test('a subagent’s command keeps holding after the main turn completes, and ends with its call', { options: KEY }, async ($, on) => {
+  const { clock, seen } = engine(on, { ads: MANY, check: 'allow', toolMs: 20_000 })
+  await start($)
+  await $.turn.start({ text: 'hi', turnId: 't1' })
+  const call = run($, 'c1', { agentId: 'bg1' })
+  await clock.advance(1)
+  await done($)
+  await $.turn.start({ text: 'again', turnId: 't2' })
+  await spin($)
+  expect(seen.message).toBe(null)
+  await during(clock, call, 20_000)
+  await spin($)
+  expect(seen.message).toContain('Sponsored: ')
+})
+
+test('an auto-approved Bash call holds (no dialog needed); a WebFetch call does not', { options: KEY }, async ($, on) => {
+  const { clock, seen, store } = engine(on, { ads: MANY, check: 'allow', toolMs: 8000 })
+  await start($)
+  await $.turn.start({ text: 'hi', turnId: 't1' })
+  await spin($)
+  const fetching = $.tool.call({ tool: 'WebFetch', url: 'https://example.com', prompt: 'x', tool_use_id: 'w1' } as any)
+  await clock.advance(SLOT_MS)
+  await spin($)
+  expect(seen.message).toContain('Sponsored: ')
+  expect(queued(store).length).toBe(1)
+  await during(clock, fetching, 3000)
+  const call = run($, 'c1')
+  await clock.advance(1)
+  await spin($)
+  expect(seen.message).toBe(null)
+  expect(await dialogsOpen($)).toBe(0)
+  await during(clock, call, 8000)
+})
+
+test('Monitor holds like a command', { options: KEY }, async ($, on) => {
+  const { clock, seen, store } = engine(on, { ads: MANY, check: 'allow', toolMs: 3000 })
+  await start($)
+  await $.turn.start({ text: 'hi', turnId: 't1' })
+  await spin($)
+  await clock.advance(2000)
+  const call = watch($, 'm1')
+  await clock.advance(1)
+  await spin($)
+  expect(seen.message).toBe(null)
+  await during(clock, call, 2999)
+  await clock.advance(SLOT_MS)
+  expect(queued(store)).toEqual([])
+})
+
+// --- Boundaries ---
+test('a command that starts 1 ms before the slot’s end voids it', { options: KEY }, async ($, on) => {
+  const { clock, seen, store } = engine(on, { ads: MANY, check: 'allow', toolMs: 100 })
+  await start($)
+  await $.turn.start({ text: 'hi', turnId: 't1' })
+  await spin($)
+  await clock.advance(SLOT_MS - 1)
+  const call = run($, 'c1')
+  await clock.advance(1)
+  expect(queued(store)).toEqual([])
+  await during(clock, call, 99)
+  await spin($)
+  expect(seen.message).toBe(line(surface, 'Ad number 1'))
+  await clock.advance(SLOT_MS - 1)
+  expect(queued(store)).toEqual([])
+  await clock.advance(1)
+  expect(queued(store).length).toBe(1)
+})
+
+test('a command that ends exactly as the ad is first drawn doesn’t void it: a fresh 5 seconds from then', { options: KEY }, async ($, on) => {
+  const { clock, seen, store } = engine(on, { ads: MANY, check: 'allow', toolMs: 2000 })
+  await start($)
+  await $.turn.start({ text: 'hi', turnId: 't1' })
+  const call = run($, 'c1')
+  await during(clock, call, 2000)
+  await spin($)
+  expect(seen.message).toBe(line(surface, 'Ad number 1'))
+  await clock.advance(SLOT_MS - 1)
+  expect(queued(store)).toEqual([])
+  await clock.advance(1)
+  expect(queued(store).length).toBe(1)
+})
+
+test('a command already running when the ad would first draw: the ad doesn’t start until it ends', { options: KEY }, async ($, on) => {
+  const { clock, seen, store } = engine(on, { ads: MANY, check: 'allow', toolMs: 4000 })
+  await start($)
+  await $.turn.start({ text: 'hi', turnId: 't1' })
+  const call = run($, 'c1')
+  await clock.advance(1000)
+  await spin($)
+  expect(seen.message).toBe(null)
+  // Nothing drawn or counted while it runs (to second 4); the ad starts when it ends, and needs its own 5 seconds from then
+  await during(clock, call, 3000)
+  expect(queued(store)).toEqual([])
+  await spin($)
+  expect(seen.message).toContain('Sponsored: ')
+  await clock.advance(SLOT_MS - 1)
+  expect(queued(store)).toEqual([])
+  await clock.advance(1)
+  expect(queued(store).length).toBe(1)
+})
+
+test('two overlapping commands: the hold lasts until both have ended', { options: KEY }, async ($, on) => {
+  const { clock, seen } = engine(on, { ads: MANY, check: 'allow', toolMs: 4000 })
+  await start($)
+  await $.turn.start({ text: 'hi', turnId: 't1' })
+  const first = run($, 'c1')
+  await clock.advance(2000)
+  const second = run($, 'c2')
+  // The first ended at 4 s; the second runs to 6 s
+  await clock.advance(2500)
+  await first
+  await spin($)
+  expect(seen.message).toBe(null)
+  await during(clock, second, 1500)
+  await spin($)
+  expect(seen.message).toContain('Sponsored: ')
+})
+
+test('a subagent’s command holds the shared screen; an agent that ends with a call never answered releases it', { options: KEY }, async ($, on) => {
+  const { clock, seen } = engine(on, { ads: MANY, check: 'allow', toolMs: 3_600_000 })
+  await start($)
+  await $.turn.start({ text: 'hi', turnId: 't1' })
+  // The call is never answered; the kit ends it with the test, and that must not count as a failure of the file
+  void run($, 'c1', { agentId: 'bg1' }).catch(() => {})
+  await clock.advance(1)
+  await spin($)
+  expect(seen.message).toBe(null)
+  await finished($, 'bg1')
+  await spin($)
+  expect(seen.message).toContain('Sponsored: ')
+})
+
+for (const [how, o] of [['throws', { toolThrows: true }], ['is denied', { toolDenies: true }]] as const) test(`a command that ${how} releases its hold, and the next turn is not held`, { options: KEY }, async ($, on) => {
+  const { clock, seen } = engine(on, { ads: MANY, check: 'allow', toolMs: 1000, ...o })
+  await start($)
+  await $.turn.start({ text: 'hi', turnId: 't1' })
+  await spin($)
+  const call = run($, 'c1').catch(() => {})
+  await during(clock, call, 1000)
+  await spin($)
+  expect(seen.message).toContain('Sponsored: ')
+  await done($)
+  await $.turn.start({ text: 'again', turnId: 't2' })
+  await spin($)
+  expect(seen.message).toContain('Sponsored: ')
+})
+
+test('a command interrupted with Esc (its call never answers) releases its hold when the turn ends', { options: KEY }, async ($, on) => {
+  const { clock, seen } = engine(on, { ads: MANY, check: 'allow', toolMs: 3_600_000 })
+  await start($)
+  await $.turn.start({ text: 'hi', turnId: 't1' })
+  void run($, 'c1').catch(() => {})
+  await clock.advance(1000)
+  await $.turn.complete({ turnId: 't1', answer: '', durationMs: 1000, isAborted: true, reason: 'aborted', usage: null })
+  await $.turn.start({ text: 'again', turnId: 't2' })
+  await spin($)
+  expect(seen.message).toContain('Sponsored: ')
+})
+
+test('a running command is not saved as a dialog: the session state holds no command markers', { options: KEY }, async ($, on) => {
+  const { clock, state } = engine(on, { ads: MANY, check: 'allow', toolMs: 8000 })
+  await start($)
+  await $.turn.start({ text: 'hi', turnId: 't1' })
+  const call = run($, 'c1')
+  const bg = background($, 'c2', { agentId: 'bg1' })
+  await clock.advance(1000)
+  await clock.settle()
+  expect(Object.keys((state.get('dialogs') as Record<string, string>) ?? {})).toEqual([])
+  // Nothing else of the command is kept either: the session state is the dialogs' and the session marker, no more
+  expect([...state.keys()].sort()).toEqual(['dialogs', 'started'])
+  expect(JSON.stringify([...state.values()])).not.toMatch(/c1|c2|bg1|curl/)
+  await during(clock, Promise.all([call, bg]), 7000)
+})
+
+// --- Background commands: a window, because the engine never says when they end ---
+test('a command left running in the background holds ads for 120 seconds from its start, just inside and just outside', { options: KEY }, async ($, on) => {
+  expect(BACKGROUND_HOLD_MS).toBe(120_000)
+  const { clock, seen, store } = engine(on, { ads: MANY, check: 'allow', toolMs: 300 })
+  await start($)
+  await $.turn.start({ text: 'hi', turnId: 't1' })
+  await spin($)
+  await clock.advance(1000)
+  const call = background($, 'b1')
+  await during(clock, call, 300)
+  await clock.advance(60_000)
+  await spin($)
+  expect(seen.message).toBe(null)
+  // 1 s + 120 s from the start; now at 61.3 s
+  await clock.advance(BACKGROUND_HOLD_MS - 60_300 - 1)
+  await spin($)
+  expect(seen.message).toBe(null)
+  expect(queued(store)).toEqual([])
+  await clock.advance(1)
+  await spin($)
+  expect(seen.message).toContain('Sponsored: ')
+})
+
+test('the known leftover: after the window ends, a view counts (the P0 is “reduced, not closed”; change this with the window)', { options: KEY }, async ($, on) => {
+  const { clock, seen, store } = engine(on, { ads: MANY, check: 'allow', toolMs: 300 })
+  await start($)
+  await $.turn.start({ text: 'hi', turnId: 't1' })
+  const call = background($, 'b1')
+  await during(clock, call, 300)
+  await clock.advance(BACKGROUND_HOLD_MS - 300)
+  await spin($)
+  await clock.advance(SLOT_MS)
+  expect(queued(store).length).toBe(1)
+  await done($)
+  await clock.advance(FLUSH_EVERY_MS)
+  expect(seen.events.length).toBe(1)
+})
+
+test('each new background start restarts the 120 seconds', { options: KEY }, async ($, on) => {
+  const { clock, seen } = engine(on, { ads: MANY, check: 'allow', toolMs: 300 })
+  await start($)
+  await $.turn.start({ text: 'hi', turnId: 't1' })
+  await during(clock, background($, 'b1'), 300)
+  await clock.advance(60_000 - 300)
+  await during(clock, background($, 'b2'), 300)
+  // 60 s + 120 s from the second start
+  await clock.advance(BACKGROUND_HOLD_MS - 300 - 1)
+  await spin($)
+  expect(seen.message).toBe(null)
+  await clock.advance(1)
+  await spin($)
+  expect(seen.message).toContain('Sponsored: ')
+})
+
+test('Monitor starts the same window', { options: KEY }, async ($, on) => {
+  const { clock, seen } = engine(on, { ads: MANY, check: 'allow', toolMs: 300 })
+  await start($)
+  await $.turn.start({ text: 'hi', turnId: 't1' })
+  await during(clock, watch($, 'm1'), 300)
+  await clock.advance(BACKGROUND_HOLD_MS - 300 - 1)
+  await spin($)
+  expect(seen.message).toBe(null)
+  await clock.advance(1)
+  await spin($)
+  expect(seen.message).toContain('Sponsored: ')
+})
+
+test('the window survives its call’s end, a subagent’s end and the turn’s end: the next turn is held too', { options: KEY }, async ($, on) => {
+  const { clock, seen } = engine(on, { ads: MANY, check: 'allow', toolMs: 300 })
+  await start($)
+  await $.turn.start({ text: 'hi', turnId: 't1' })
+  await during(clock, background($, 'b1', { agentId: 'bg1' }), 300)
+  await finished($, 'bg1')
+  await spin($)
+  expect(seen.message).toBe(null)
+  await done($)
+  await clock.advance(10_000)
+  await $.turn.start({ text: 'again', turnId: 't2' })
+  await spin($)
+  expect(seen.message).toBe(null)
+  await clock.advance(BACKGROUND_HOLD_MS - 10_300)
+  await spin($)
+  expect(seen.message).toContain('Sponsored: ')
+})
+
+test('a foreground command never opens the window: the ad is back as soon as it ends', { options: KEY }, async ($, on) => {
+  const { clock, seen } = engine(on, { ads: MANY, check: 'allow', toolMs: 300 })
+  await start($)
+  await $.turn.start({ text: 'hi', turnId: 't1' })
+  await during(clock, run($, 'c1'), 300)
+  await spin($)
+  expect(seen.message).toContain('Sponsored: ')
+})
+
+// Codex round 2: a Bash call that starts in the foreground can end up in the background (Ctrl+B, its timeout, a message queued for the
+// model). It returns while the process lives on, so its result is the only sign: the window starts as the call returns
+const bashOut = (extra: Record<string, unknown>) => ({ stdout: '', stderr: '', interrupted: false, ...extra })
+// Each sign alone: the engine sets them together, and a window missed is a view that can count under a prompt
+for (const [how, extra] of [
+  ['the user pressed Ctrl+B', { backgroundedByUser: true }],
+  ['it hit its timeout', { timedOutAfterMs: 2000 }],
+  ['a message queued for the model moved it', { backgroundedToDeliverMessage: true }],
+  ['a turn abort moved it', { backgroundedByTurnAbort: true }],
+] as const) test(`a foreground command that went to the background (${how}) opens the window as its call returns`, { options: KEY }, async ($, on) => {
+  const { clock, seen } = engine(on, { ads: MANY, check: 'allow', toolMs: 3000, toolResult: bashOut(extra) })
+  await start($)
+  await $.turn.start({ text: 'hi', turnId: 't1' })
+  await spin($)
+  const call = run($, 'c1')
+  await during(clock, call, 3000)
+  // 120 s from the moment the call returned (3 s in), not from its start
+  await clock.advance(BACKGROUND_HOLD_MS - 1)
+  await spin($)
+  expect(seen.message).toBe(null)
+  await clock.advance(1)
+  await spin($)
+  expect(seen.message).toContain('Sponsored: ')
+})
+
+test('a foreground command that finished (a result with no background task) opens no window', { options: KEY }, async ($, on) => {
+  const { clock, seen } = engine(on, { ads: MANY, check: 'allow', toolMs: 300, toolResult: bashOut({ exitCode: 0 }) })
+  await start($)
+  await $.turn.start({ text: 'hi', turnId: 't1' })
+  await during(clock, run($, 'c1'), 300)
+  await spin($)
+  expect(seen.message).toContain('Sponsored: ')
+})
+
+// --- Exact tracking (Mod 0.2.37): a background command the engine itself tracks holds ads until the engine says it ended ---
+// Claude Code registers each background command and names it in the call's result (Bash: backgroundTaskId, Monitor: taskId). The input
+// of classic.Stop and classic.SubagentStop lists what is still running (`background_tasks`, a snapshot of the whole session): a task that
+// ended, failed or was stopped is gone from the next one. A completion notice (a UserMessage row with `task`) is a faster hint. The hold
+// ends only on that evidence, never on a timer, a call's end, a subagent's end or a turn's end (probe on engine 2.1.310, plan "Decided" 7).
+const taskOf = (callId: string) => `task-${callId}`
+// What the engine's result says of a call that went to the background: the task's name. A foreground call names none.
+const named = (e: { tool: string; tool_use_id?: string; run_in_background?: boolean }) =>
+  e.tool === 'Monitor' ? { taskId: taskOf(e.tool_use_id!), timeoutMs: 60_000, persistent: false } : e.run_in_background ? bashOut({ backgroundTaskId: taskOf(e.tool_use_id!) }) : bashOut({ exitCode: 0 })
+const listed = (...ids: string[]) => ids.map((id) => ({ id, type: 'shell', status: 'running', description: 'a background command' }))
+// `tasks` left out: the Stop input has no background_tasks field at all
+const stopWith = ($: any, tasks?: unknown) => $.classic.Stop({ stop_hook_active: false, ...(tasks === undefined ? {} : { background_tasks: tasks }) })
+const subStopWith = ($: any, tasks?: unknown, agentId = 'sub1') =>
+  $.classic.SubagentStop({ stop_hook_active: false, agent_id: agentId, agent_type: 'general-purpose', agent_transcript_path: '/t', ...(tasks === undefined ? {} : { background_tasks: tasks }) })
+// `status` null: a notice whose task names no status
+const notice = ($: any, id: string, status: string | null = 'completed', kind = 'task-notification') =>
+  $.ui.mount({ plugin: 'spinsponsor', component: 'UserMessage', surface: 'terminal', requestId: `n${Math.random()}`, props: { text: 'Background command finished', origin: { kind }, isExpanded: false, task: status === null ? { id } : { id, status } } })
+const tracked = async ($: any) => Number((await ads($, 'status')).match(/background commands tracked: (\d+)/)?.[1])
+const adShown = async ($: any, seen: { message: string | null }) => {
+  await spin($)
+  return (seen.message ?? '').startsWith('Sponsored: ')
+}
+// A session an ad is showing in, ready for the first background call
+async function afterStart($: any, on: Parameters<Parameters<typeof test>[1]>[1], o: Opts = {}) {
+  const e = engine(on, { ads: MANY, check: 'allow', toolMs: 300, resultFor: named, ...o })
+  await start($)
+  await $.turn.start({ text: 'hi', turnId: 't1' })
+  await spin($)
+  return e
+}
+
+test('a background command the engine tracks holds ads until a Stop snapshot lacks it: not at 120 s, not at 10 minutes, not on a snapshot that still lists it', { options: KEY }, async ($, on) => {
+  const { clock, seen, store } = await afterStart($, on)
+  await during(clock, background($, 'b1'), 300)
+  expect(await tracked($)).toBe(1)
+  // The old fixed window has long ended
+  await clock.advance(BACKGROUND_HOLD_MS)
+  expect(await adShown($, seen)).toBe(false)
+  await clock.advance(10 * 60_000)
+  await stopWith($, listed(taskOf('b1')))
+  expect(await adShown($, seen)).toBe(false)
+  expect(await tracked($)).toBe(1)
+  // Nothing was counted in all that time: not waiting to be sent, and not sent either
+  expect(queued(store)).toEqual([])
+  expect(seen.events).toEqual([])
+  // It ends: the next snapshot lacks it. A fresh 5 seconds, then one view
+  await stopWith($, [])
+  expect(await tracked($)).toBe(0)
+  expect(await adShown($, seen)).toBe(true)
+  expect(queued(store)).toEqual([])
+  await clock.advance(SLOT_MS)
+  expect(queued(store).length).toBe(1)
+  // Both Stops reached the engine
+  expect(seen.stops).toEqual(['main', 'main'])
+})
+
+test('a command that ends after 10 seconds gives the ads back at its next snapshot, long before 120 seconds', { options: KEY }, async ($, on) => {
+  const { clock, seen } = await afterStart($, on)
+  await during(clock, background($, 'b1'), 300)
+  await clock.advance(10_000)
+  expect(await adShown($, seen)).toBe(false)
+  await stopWith($, [])
+  expect(await adShown($, seen)).toBe(true)
+})
+
+test('on release the next ad is queued at once, without waiting for a redraw', { options: KEY }, async ($, on) => {
+  const { clock } = await afterStart($, on)
+  await during(clock, background($, 'b1'), 300)
+  expect(await adNow($)).toBe('ad now: none')
+  await clock.advance(SNAPSHOT_GRACE_MS)
+  await stopWith($, [])
+  await clock.settle()
+  // The mounted spinner is redrawn by the slot's invalidate (a real terminal does the same on its next draw)
+  expect(await adNow($)).toMatch(/^ad now: line/)
+})
+
+test('Monitor: its result names the task (taskId); it holds the same way and ends on the snapshot', { options: KEY }, async ($, on) => {
+  const { clock, seen } = await afterStart($, on)
+  await during(clock, watch($, 'm1'), 300)
+  expect(await tracked($)).toBe(1)
+  await clock.advance(10 * 60_000)
+  expect(await adShown($, seen)).toBe(false)
+  await stopWith($, listed(taskOf('m1')))
+  expect(await adShown($, seen)).toBe(false)
+  await stopWith($, [])
+  expect(await adShown($, seen)).toBe(true)
+})
+
+test('several tasks at once: each ends on its own; ads wait for the last', { options: KEY }, async ($, on) => {
+  const { clock, seen } = await afterStart($, on)
+  await during(clock, background($, 'b1'), 300)
+  await during(clock, watch($, 'm1'), 300)
+  await during(clock, background($, 'b2'), 300)
+  expect(await tracked($)).toBe(3)
+  await clock.advance(SNAPSHOT_GRACE_MS)
+  await stopWith($, listed(taskOf('b1'), taskOf('m1'), taskOf('b2')))
+  expect(await tracked($)).toBe(3)
+  // b1 and b2 ended; the Monitor runs on
+  await stopWith($, listed(taskOf('m1')))
+  expect(await tracked($)).toBe(1)
+  expect(await adShown($, seen)).toBe(false)
+  // A snapshot that lists some other task changes nothing
+  await stopWith($, listed('somebody-elses'))
+  expect(await tracked($)).toBe(0)
+  expect(await adShown($, seen)).toBe(true)
+})
+
+test('a snapshot that lists a different task releases nothing it does not list, and one that lists the task keeps it', { options: KEY }, async ($, on) => {
+  const { clock, seen } = await afterStart($, on)
+  await during(clock, background($, 'b1'), 300)
+  await during(clock, background($, 'b2'), 300)
+  await clock.advance(SNAPSHOT_GRACE_MS)
+  await stopWith($, listed(taskOf('b2'), 'other'))
+  expect(await tracked($)).toBe(1)
+  expect(await adShown($, seen)).toBe(false)
+})
+
+test('a subagent’s background command holds past its call, its agent’s end and the turn’s end; only a snapshot that lacks it ends it', { options: KEY }, async ($, on) => {
+  const { clock, seen } = await afterStart($, on)
+  await during(clock, background($, 'b1', { agentId: 'bg1' }), 300)
+  await finished($, 'bg1')
+  expect(await tracked($)).toBe(1)
+  expect(await adShown($, seen)).toBe(false)
+  await done($)
+  await clock.advance(10 * 60_000)
+  await $.turn.start({ text: 'again', turnId: 't2' })
+  expect(await tracked($)).toBe(1)
+  expect(await adShown($, seen)).toBe(false)
+  // A subagent's own Stop sees the whole session's list: still listed, still held
+  await subStopWith($, listed(taskOf('b1')), 'bg1')
+  expect(await adShown($, seen)).toBe(false)
+  await subStopWith($, [], 'bg1')
+  expect(await tracked($)).toBe(0)
+  expect(await adShown($, seen)).toBe(true)
+  expect(seen.stops).toEqual(['bg1', 'bg1'])
+})
+
+test('a main Stop releases a task a subagent started', { options: KEY }, async ($, on) => {
+  const { clock, seen } = await afterStart($, on)
+  await during(clock, background($, 'b1', { agentId: 'bg1' }), 300)
+  await clock.advance(SNAPSHOT_GRACE_MS)
+  await stopWith($, [])
+  expect(await adShown($, seen)).toBe(true)
+})
+
+// A snapshot is built a moment before the Mod gets it: one built before a task was registered can arrive after the Mod recorded it
+test('a snapshot that lacks a task recorded moments ago may predate it: it releases nothing until SNAPSHOT_GRACE_MS has passed', { options: KEY }, async ($, on) => {
+  const { clock, seen } = await afterStart($, on)
+  // Recorded as its call returns, 300 ms in
+  await during(clock, background($, 'b1'), 300)
+  await stopWith($, [])
+  await subStopWith($, [])
+  expect(await tracked($)).toBe(1)
+  expect(await adShown($, seen)).toBe(false)
+  await clock.advance(SNAPSHOT_GRACE_MS - 1)
+  await stopWith($, [])
+  expect(await tracked($)).toBe(1)
+  await clock.advance(1)
+  await stopWith($, [])
+  expect(await tracked($)).toBe(0)
+  expect(await adShown($, seen)).toBe(true)
+})
+
+test('the grace is each task’s own: an old task is released by a snapshot that still keeps a young one', { options: KEY }, async ($, on) => {
+  const { clock } = await afterStart($, on)
+  await during(clock, background($, 'b1'), 300)
+  await clock.advance(SNAPSHOT_GRACE_MS)
+  await during(clock, background($, 'b2'), 300)
+  await stopWith($, [])
+  expect(await tracked($)).toBe(1)
+  await clock.advance(SNAPSHOT_GRACE_MS)
+  await stopWith($, [])
+  expect(await tracked($)).toBe(0)
+})
+
+test('a completion notice is not held to the grace: the engine said the task ended', { options: KEY }, async ($, on) => {
+  const { clock, seen } = await afterStart($, on)
+  await during(clock, background($, 'b1'), 300)
+  await notice($, taskOf('b1'))
+  expect(await tracked($)).toBe(0)
+  expect(await adShown($, seen)).toBe(true)
+})
+
+// A Stop with no list, on an engine that has sent one before, is a lapse: the tasks stay tracked, and the next list decides (Codex review)
+test('a Stop without a list after a readable one keeps the tracked task; the next list that lacks it releases it', { options: KEY }, async ($, on) => {
+  const { clock, seen } = await afterStart($, on)
+  // Nothing tracked yet, but the engine has shown it sends lists
+  await stopWith($, [])
+  await during(clock, background($, 'b1'), 300)
+  await clock.advance(SNAPSHOT_GRACE_MS)
+  await stopWith($)
+  await stopWith($, null)
+  await subStopWith($)
+  expect(await tracked($)).toBe(1)
+  expect(await ads($, 'status')).not.toContain('background window open')
+  await clock.advance(BACKGROUND_HOLD_MS * 2)
+  expect(await adShown($, seen)).toBe(false)
+  await stopWith($, listed(taskOf('b1')))
+  expect(await tracked($)).toBe(1)
+  await stopWith($, [])
+  expect(await tracked($)).toBe(0)
+  expect(await adShown($, seen)).toBe(true)
+})
+
+test('a readable list from a subagent’s Stop also shows the engine sends lists', { options: KEY }, async ($, on) => {
+  const { clock } = await afterStart($, on)
+  await subStopWith($, [])
+  await during(clock, background($, 'b1'), 300)
+  await stopWith($)
+  expect(await tracked($)).toBe(1)
+})
+
+// A first Stop with no list, before the engine has sent one, hands the task to the window; a later list that still shows it brings it back
+test('a task handed to the window by a first Stop without a list is tracked again when a later list still shows it', { options: KEY }, async ($, on) => {
+  const { clock, seen } = await afterStart($, on)
+  await during(clock, background($, 'b1'), 300)
+  await clock.advance(30_000)
+  await stopWith($)
+  expect(await tracked($)).toBe(0)
+  await clock.advance(30_000)
+  await stopWith($, listed(taskOf('b1')))
+  expect(await tracked($)).toBe(1)
+  // Past the window, and the list's word still stands
+  await clock.advance(BACKGROUND_HOLD_MS * 2)
+  expect(await adShown($, seen)).toBe(false)
+  await stopWith($, [])
+  expect(await tracked($)).toBe(0)
+  expect(await adShown($, seen)).toBe(true)
+})
+
+// Codex round 3: the grace travels with the task through the hand-over and back
+test('a task handed to the window inside its grace is not forgotten by a stale list; one old enough is', { options: KEY }, async ($, on) => {
+  const { clock } = await afterStart($, on)
+  await during(clock, background($, 'b1'), 300)
+  await clock.advance(1000)
+  await stopWith($)
+  // Not old enough yet: a list without it is no word on it
+  await stopWith($, [])
+  await clock.advance(30_000)
+  await stopWith($, listed(taskOf('b1')))
+  expect(await tracked($)).toBe(1)
+  // And once it is old enough, a list without it releases it
+  await stopWith($, [])
+  expect(await tracked($)).toBe(0)
+})
+
+test('a task brought back inside its grace is still held to it', { options: KEY }, async ($, on) => {
+  const { clock } = await afterStart($, on)
+  await during(clock, background($, 'b1'), 300)
+  await clock.advance(1000)
+  await stopWith($)
+  await stopWith($, listed(taskOf('b1')))
+  expect(await tracked($)).toBe(1)
+  await stopWith($, [])
+  expect(await tracked($)).toBe(1)
+  await clock.advance(SNAPSHOT_GRACE_MS)
+  // Old enough now, and a list that still shows it must not make it young again
+  await stopWith($, listed(taskOf('b1')))
+  await stopWith($, [])
+  expect(await tracked($)).toBe(0)
+})
+
+test('a task the window held that the next list does not show is forgotten for good', { options: KEY }, async ($, on) => {
+  const { clock } = await afterStart($, on)
+  await during(clock, background($, 'b1'), 300)
+  await stopWith($)
+  // Old enough by now for a list's silence to count
+  await clock.advance(SNAPSHOT_GRACE_MS)
+  await stopWith($, [])
+  await stopWith($, listed(taskOf('b1')))
+  expect(await tracked($)).toBe(0)
+})
+
+test('a completion notice for a task the window held forgets it too', { options: KEY }, async ($, on) => {
+  const { clock } = await afterStart($, on)
+  await during(clock, background($, 'b1'), 300)
+  await stopWith($)
+  await notice($, taskOf('b1'))
+  await stopWith($, listed(taskOf('b1')))
+  expect(await tracked($)).toBe(0)
+})
+
+test('a task brought back after its window ended voids the ad on screen', { options: KEY }, async ($, on) => {
+  const { clock, seen, store } = await afterStart($, on)
+  await during(clock, background($, 'b1'), 300)
+  await stopWith($)
+  await clock.advance(BACKGROUND_HOLD_MS)
+  expect(await adShown($, seen)).toBe(true)
+  await clock.advance(2000)
+  await stopWith($, listed(taskOf('b1')))
+  expect(await adNow($)).toBe('ad now: none')
+  await clock.advance(SLOT_MS * 2)
+  expect(queued(store)).toEqual([])
+  expect(await adShown($, seen)).toBe(false)
+  // The time held counts again from the moment it came back: 120.3 s in the window, then the 10 s above
+  await stopWith($, [])
+  await clock.advance(30_000)
+  expect(await cmdStatus($)).toMatch(/held back by commands: 130 s/)
+})
+
+// The engine's notice can be drawn before the call that names the task has returned (a notice is delivered into a running turn too)
+test('a task whose completion notice was drawn before its call returned is not held', { options: KEY }, async ($, on) => {
+  const { clock, seen } = await afterStart($, on)
+  const call = background($, 'b1')
+  await notice($, taskOf('b1'))
+  await during(clock, call, 300)
+  expect(await tracked($)).toBe(0)
+  expect(await adShown($, seen)).toBe(true)
+})
+
+test('no call, subagent or turn ending releases a tracked command, however long it all takes', { options: KEY }, async ($, on) => {
+  const { clock, seen } = await afterStart($, on)
+  await during(clock, background($, 'b1'), 300)
+  await during(clock, run($, 'c1', { agentId: 'bg2' }), 300)
+  await finished($, 'bg2')
+  await done($)
+  await clock.advance(60 * 60_000)
+  await $.turn.start({ text: 'again', turnId: 't2' })
+  await during(clock, run($, 'c2'), 300)
+  expect(await tracked($)).toBe(1)
+  expect(await adShown($, seen)).toBe(false)
+})
+
+// An engine that sends no list (or one this Mod cannot read) leaves nothing to end the hold on: the old rule, 120 seconds, from that Stop
+for (const [what, tasks] of [['has no background_tasks field', undefined], ['has null for it', null], ['has something that is not a list', 'none'], ['lists entries with no id', [{ type: 'shell', status: 'running' }]], ['lists an entry whose id is not text', [{ id: 7 }]]] as const) test(`a Stop that ${what} is not an empty list: nothing is released at once, and the 120-second rule runs from it`, { options: KEY }, async ($, on) => {
+  const { clock, seen } = await afterStart($, on)
+  await during(clock, background($, 'b1'), 300)
+  await clock.advance(30_000)
+  await stopWith($, tasks)
+  expect(await adShown($, seen)).toBe(false)
+  expect(await tracked($)).toBe(0)
+  expect(await ads($, 'status')).toContain('background window open')
+  await clock.advance(BACKGROUND_HOLD_MS - 1)
+  expect(await adShown($, seen)).toBe(false)
+  await clock.advance(1)
+  expect(await adShown($, seen)).toBe(true)
+})
+
+test('a subagent’s Stop without a list is ignored: the tracked command stays tracked', { options: KEY }, async ($, on) => {
+  const { clock, seen } = await afterStart($, on)
+  await during(clock, background($, 'b1'), 300)
+  await subStopWith($)
+  await subStopWith($, 'none')
+  await clock.advance(BACKGROUND_HOLD_MS * 2)
+  expect(await tracked($)).toBe(1)
+  expect(await adShown($, seen)).toBe(false)
+})
+
+test('a Stop while nothing is tracked changes nothing', { options: KEY }, async ($, on) => {
+  const { seen } = await afterStart($, on)
+  // No list yet on this engine, and nothing tracked: nothing to hand to a window
+  await stopWith($)
+  expect(await ads($, 'status')).not.toContain('background window open')
+  await stopWith($, listed('whatever'))
+  expect(await adShown($, seen)).toBe(true)
+  expect(await ads($, 'status')).not.toContain('background window open')
+})
+
+// The completion notice: a faster hint than the next Stop, for a wake-up turn
+for (const status of ['completed', 'failed', 'killed']) test(`a ${status} notice for a tracked task gives the ads back at once, before any Stop`, { options: KEY }, async ($, on) => {
+  const { clock, seen } = await afterStart($, on)
+  await during(clock, background($, 'b1'), 300)
+  await done($)
+  // The command ends; the engine starts a turn of its own and draws the notice
+  await clock.advance(60_000)
+  await $.turn.start({ text: '', turnId: 't2' })
+  expect(await adShown($, seen)).toBe(false)
+  const ui = await notice($, taskOf('b1'), status)
+  expect(await tracked($)).toBe(0)
+  expect(await adShown($, seen)).toBe(true)
+  // The row is drawn as it was
+  expect((await ui.findAll({ type: 'Text' }))[0]?.text).toBe('Background command finished')
+})
+
+for (const [what, id, status, kind] of [
+  ['a notice for another task', 'task-other', 'completed', 'task-notification'],
+  ['a notice that is not about an ending (status running)', 'task-b1', 'running', 'task-notification'],
+  ['a notice with no status', 'task-b1', null, 'task-notification'],
+  ['a row the person typed that looks like a notice', 'task-b1', 'completed', 'composer'],
+] as const) test(`${what} does not release a tracked task`, { options: KEY }, async ($, on) => {
+  const { clock, seen } = await afterStart($, on)
+  await during(clock, background($, 'b1'), 300)
+  await notice($, id, status, kind)
+  expect(await tracked($)).toBe(1)
+  expect(await adShown($, seen)).toBe(false)
+})
+
+test('a message row with no task changes nothing', { options: KEY }, async ($, on) => {
+  const { clock, seen } = await afterStart($, on)
+  await during(clock, background($, 'b1'), 300)
+  const ui = await $.ui.mount({ plugin: 'spinsponsor', component: 'UserMessage', surface: 'terminal', requestId: 'plain', props: { text: 'hello', origin: { kind: 'composer' }, isExpanded: false } })
+  expect((await ui.findAll({ type: 'Text' }))[0]?.text).toBe('hello')
+  expect(await tracked($)).toBe(1)
+  expect(await adShown($, seen)).toBe(false)
+})
+
+// The fallbacks: no task named, nothing the engine will report on, so the old fixed window
+test('a background start whose result names no task keeps the 120-second window, which no snapshot ends early', { options: KEY }, async ($, on) => {
+  const { clock, seen } = await afterStart($, on, { resultFor: undefined })
+  await during(clock, background($, 'b1'), 300)
+  expect(await tracked($)).toBe(0)
+  await stopWith($, [])
+  expect(await adShown($, seen)).toBe(false)
+  await clock.advance(BACKGROUND_HOLD_MS - 300 - 1)
+  expect(await adShown($, seen)).toBe(false)
+  await clock.advance(1)
+  expect(await adShown($, seen)).toBe(true)
+  // The window's whole 120 seconds counted as held back
+  expect(await cmdStatus($)).toMatch(/commands running: 0 · held back by commands: 120 s/)
+})
+
+for (const [what, result] of [
+  ['an empty id', bashOut({ backgroundTaskId: '' })],
+  ['an id that is not text', bashOut({ backgroundTaskId: 12 })],
+] as const) test(`a background Bash with ${what} is not tracked: the window`, { options: KEY }, async ($, on) => {
+  const { clock, seen } = await afterStart($, on, { resultFor: () => result })
+  await during(clock, background($, 'b1'), 300)
+  expect(await tracked($)).toBe(0)
+  await clock.advance(BACKGROUND_HOLD_MS - 300 - 1)
+  expect(await adShown($, seen)).toBe(false)
+  await clock.advance(1)
+  expect(await adShown($, seen)).toBe(true)
+})
+
+test('a Monitor whose result has no taskId is not tracked: the window', { options: KEY }, async ($, on) => {
+  const { clock, seen } = await afterStart($, on, { resultFor: () => ({ timeoutMs: 60_000 }) })
+  await during(clock, watch($, 'm1'), 300)
+  expect(await tracked($)).toBe(0)
+  await clock.advance(BACKGROUND_HOLD_MS - 300 - 1)
+  expect(await adShown($, seen)).toBe(false)
+  await clock.advance(1)
+  expect(await adShown($, seen)).toBe(true)
+})
+
+test('a Bash result names its task as backgroundTaskId only: a taskId on a Bash result is not read', { options: KEY }, async ($, on) => {
+  const { clock, seen } = await afterStart($, on, { resultFor: () => bashOut({ taskId: 'x', backgroundedByUser: true }) })
+  await during(clock, run($, 'c1'), 300)
+  expect(await tracked($)).toBe(0)
+  await clock.advance(BACKGROUND_HOLD_MS - 1)
+  expect(await adShown($, seen)).toBe(false)
+})
+
+test('a background call that throws still opens the window (it may have started the command)', { options: KEY }, async ($, on) => {
+  const { clock, seen } = await afterStart($, on, { toolThrows: true })
+  await during(clock, background($, 'b1').catch(() => {}), 300)
+  expect(await tracked($)).toBe(0)
+  expect(await adShown($, seen)).toBe(false)
+  await clock.advance(BACKGROUND_HOLD_MS - 300 - 1)
+  expect(await adShown($, seen)).toBe(false)
+  await clock.advance(1)
+  expect(await adShown($, seen)).toBe(true)
+})
+
+test('a foreground Bash moved to the background that names its task (Ctrl+B) is tracked too, not held for 120 seconds', { options: KEY }, async ($, on) => {
+  const { clock, seen } = await afterStart($, on, { resultFor: () => bashOut({ backgroundedByUser: true, backgroundTaskId: 'x1' }) })
+  await during(clock, run($, 'c1'), 300)
+  expect(await tracked($)).toBe(1)
+  await clock.advance(BACKGROUND_HOLD_MS * 3)
+  expect(await adShown($, seen)).toBe(false)
+  await stopWith($, listed('x1'))
+  expect(await adShown($, seen)).toBe(false)
+  await stopWith($, [])
+  expect(await adShown($, seen)).toBe(true)
+})
+
+test('a tracked start cancels only its own window: an earlier start that named no task keeps its 120 seconds', { options: KEY }, async ($, on) => {
+  const { clock, seen } = await afterStart($, on, { resultFor: (e) => (e.tool_use_id === 'b2' ? named(e) : bashOut({})) })
+  // b1 names no task: a window of 120 s from its start (time 0)
+  await during(clock, background($, 'b1'), 300)
+  await clock.advance(1000)
+  await during(clock, background($, 'b2'), 300)
+  expect(await tracked($)).toBe(1)
+  await clock.advance(SNAPSHOT_GRACE_MS)
+  await stopWith($, [])
+  expect(await tracked($)).toBe(0)
+  expect(await adShown($, seen)).toBe(false)
+  // 1,600 ms and the grace have passed; b1's window ends at 120,000
+  await clock.advance(BACKGROUND_HOLD_MS - 1600 - SNAPSHOT_GRACE_MS - 1)
+  expect(await adShown($, seen)).toBe(false)
+  await clock.advance(1)
+  expect(await adShown($, seen)).toBe(true)
+})
+
+test('/ads status counts the tracked commands (never their ids) and keeps counting the time they held ads back', { options: KEY }, async ($, on) => {
+  const { clock } = await afterStart($, on)
+  expect(await tracked($)).toBe(0)
+  await during(clock, background($, 'b1'), 300)
+  await during(clock, watch($, 'm1'), 300)
+  const status = await ads($, 'status')
+  expect(status).toContain('background commands tracked: 2')
+  expect(status).not.toMatch(/task-b1|task-m1|Ad number|ss_test/)
+  await clock.advance(600_000)
+  await stopWith($, [])
+  expect(await tracked($)).toBe(0)
+  // The time stops counting when the hold ends
+  await clock.advance(30_000)
+  expect(await cmdStatus($)).toMatch(/commands running: 0 · held back by commands: 60[01] s/)
+})
+
+test('tracked commands are never saved: the session state holds only the dialogs and the session marker', { options: KEY }, async ($, on) => {
+  const { clock, state } = await afterStart($, on)
+  await during(clock, background($, 'b1'), 300)
+  await during(clock, watch($, 'm1'), 300)
+  await clock.settle()
+  expect([...state.keys()].sort()).toEqual(['dialogs', 'started'])
+  expect(state.get('dialogs')).toEqual({})
+  expect(JSON.stringify([...state.values()])).not.toMatch(/b1|m1|task-/)
+})
+
+// startSlot checks nothing before it reads the clock, so its own check after the read is all that keeps a new turn from taking an ad
+test('a turn that starts while a background command is tracked takes no ad slot', { options: KEY }, async ($, on) => {
+  const { clock, seen } = await afterStart($, on)
+  await during(clock, background($, 'b1'), 300)
+  await done($)
+  await $.turn.start({ text: 'again', turnId: 't2' })
+  await clock.settle()
+  expect(await adNow($)).toBe('ad now: none')
+  expect(await adShown($, seen)).toBe(false)
+})
+
+for (const where of ['terminal line', 'terminal card', 'desktop card'] as const) test(`${where}: a tracked background command keeps the ad off, and nothing counts, until the engine says it ended`, { options: KEY }, async ($, on) => {
+  const { clock, seen, store } = engine(on, { ads: MANY, check: 'allow', toolMs: 300, resultFor: named })
+  const draw = () => (where === 'terminal line' ? spin($) : where === 'terminal card' ? tcard($) : card($))
+  await start($)
+  await $.turn.start({ text: 'hi', turnId: 't1' })
+  await draw()
+  await clock.advance(2000)
+  await during(clock, background($, 'b1'), 300)
+  await draw()
+  await clock.advance(10 * 60_000)
+  await draw()
+  await clock.advance(SLOT_MS)
+  expect(queued(store)).toEqual([])
+  await stopWith($, [])
+  await draw()
+  await clock.advance(SLOT_MS)
+  expect(queued(store).length).toBe(1)
+  await done($)
+  await clock.advance(FLUSH_EVERY_MS)
+  expect(seen.events.map((e: any) => e.format)).toEqual([where === 'terminal line' ? 'line' : 'card'])
+})
+
+// --- Every surface: the hold is shared state, not one render hook's ---
+for (const where of ['terminal line', 'terminal card', 'desktop card'] as const) test(`${where}: a command voids the ad on screen, and nothing counts until it ends`, { options: KEY }, async ($, on) => {
+  const { clock, seen, store } = engine(on, { ads: MANY, check: 'allow', toolMs: 8000 })
+  const draw = () => (where === 'terminal line' ? spin($) : where === 'terminal card' ? tcard($) : card($))
+  await start($)
+  await $.turn.start({ text: 'hi', turnId: 't1' })
+  await draw()
+  await clock.advance(2000)
+  const call = run($, 'c1')
+  await clock.advance(SLOT_MS)
+  expect(queued(store)).toEqual([])
+  await during(clock, call, 3000)
+  await clock.advance(SLOT_MS)
+  expect(queued(store).length).toBe(1)
+  await done($)
+  await clock.advance(FLUSH_EVERY_MS)
+  expect(seen.events.map((e: any) => e.format)).toEqual([where === 'terminal line' ? 'line' : 'card'])
+})
+
+// --- /ads status: the counters that size what the hold costs ---
+test('/ads status counts commands running, the time they held ads back and the slots they cut short; no ad text, link or key', { options: KEY }, async ($, on) => {
+  const { clock } = engine(on, { ads: MANY, check: 'allow', toolMs: 8000 })
+  await start($)
+  await $.turn.start({ text: 'hi', turnId: 't1' })
+  await spin($)
+  expect(await cmdStatus($)).toBe('commands running: 0 · held back by commands: 0 s · ad slots cut short: 0')
+  await clock.advance(2000)
+  const call = run($, 'c1')
+  await clock.advance(1000)
+  const during1 = await ads($, 'status')
+  expect(during1).toContain('commands running: 1')
+  expect(during1).not.toMatch(/Ad number|localhost:8787\/c\/|ss_test/)
+  await during(clock, call, 7000)
+  expect(await cmdStatus($)).toBe('commands running: 0 · held back by commands: 8 s · ad slots cut short: 1')
+})
+
+// --- Reload (B4): after any reload ads stay off until Claude Code restarts ---
+test('a first load writes the session marker before any ad fetch, and ads then show', { options: KEY }, async ($, on) => {
+  const { clock, seen, state, markerWrites } = engine(on, { ads: MANY, markerSetMs: 3000 })
+  const started = start($)
+  await clock.advance(2999)
+  // The marker's write hasn't landed: no permission check, no fetch, no ad
+  expect(seen.fetches).toEqual([])
+  expect(state.has('started')).toBe(false)
+  await clock.advance(1)
+  await started
+  expect(state.get('started')).toBe(true)
+  // Written once, and only while nobody had written it (a second load racing this one loses)
+  expect(markerWrites).toEqual([0])
+  await $.turn.start({ text: 'hi', turnId: 't1' })
+  await spin($)
+  expect(seen.message).toContain('Sponsored: ')
+})
+
+test('a second load finds the marker: ads stay off for the session, with one message', { options: KEY }, async ($, on) => {
+  const { clock, seen, state } = engine(on, { ads: MANY, started: true })
+  await start($)
+  await $.turn.start({ text: 'hi', turnId: 't1' })
+  await spin($)
+  expect(seen.message).toBe(null)
+  await clock.advance(FLUSH_EVERY_MS)
+  await done($)
+  await $.turn.start({ text: 'again', turnId: 't2' })
+  await spin($)
+  expect(seen.message).toBe(null)
+  expect(seen.toasts.filter((t) => t.includes('Restart Claude Code')).length).toBe(1)
+  expect(await ads($, 'status')).toContain('restart Claude Code')
+  // Still marked, so a third load stays off too
+  expect(state.get('started')).toBe(true)
+})
+
+// Codex review: a Claude Code session that was running Mod 0.2.35 (saves an empty dialogs map at start-up, no marker, and never knew
+// of background commands) and reloads into this Mod is a reload like any other
+test('a reload from Mod 0.2.35 (an empty dialogs map saved, no session marker) turns ads off too', { options: KEY }, async ($, on) => {
+  const { seen, state } = engine(on, { ads: MANY, dialogs: {} })
+  await start($)
+  await $.turn.start({ text: 'hi', turnId: 't1' })
+  await spin($)
+  expect(seen.message).toBe(null)
+  expect(seen.toasts.filter((t) => t.includes('Restart Claude Code')).length).toBe(1)
+  // Nothing is written that could make a third load think it was the first
+  expect(state.has('started')).toBe(false)
+})
+
+for (const [what, o] of [['fails', { markerSetFails: true }], ['is refused (another load wrote it first)', { markerRace: true }], ['never answers', { markerSetMs: 3_600_000 }]] as const) test(`a marker write that ${what} keeps ads off for the session, with one message`, { options: KEY }, async ($, on) => {
+  const { clock, seen } = engine(on, { ads: MANY, ...o })
+  const started = start($)
+  await clock.advance(MARKER_WAIT_MS)
+  await started
+  await $.turn.start({ text: 'hi', turnId: 't1' })
+  await spin($)
+  expect(seen.message).toBe(null)
+  expect(seen.toasts.filter((t) => t.includes('Restart Claude Code')).length).toBe(1)
+  // Never an ad fetch for a session that may be a reload
+  await clock.advance(FLUSH_EVERY_MS)
+  expect(adFetches(seen)).toBe(0)
 })
