@@ -1,0 +1,14 @@
+{
+  "name": "spinsponsor",
+  "description": "SpinSponsor: sponsored spinner lines for Claude Code, with a 50/50 revenue share",
+  "owner": {
+    "name": "SpinSponsor"
+  },
+  "plugins": [
+    {
+      "name": "spinsponsor",
+      "source": "./packages/mod",
+      "description": "Shows one labelled sponsored line in the Claude Code spinner and shares the ad revenue with you"
+    }
+  ]
+}

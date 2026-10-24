@@ -1,0 +1,24 @@
+{
+  "name": "spinsponsor",
+  "version": "0.2.35",
+  "description": "Shows one labelled sponsored line in the Claude Code spinner while Claude works, and shares the ad revenue with you",
+  "author": {
+    "name": "SpinSponsor"
+  },
+  "types": "./types/index.d.ts",
+  "userConfig": {
+    "install_key": {
+      "type": "string",
+      "title": "Install key",
+      "description": "From your SpinSponsor dashboard (Add a machine). Leave empty to stay signed out: no ads, no network.",
+      "sensitive": true,
+      "default": ""
+    },
+    "api_url": {
+      "type": "string",
+      "title": "API address",
+      "description": "Where SpinSponsor fetches ads. Leave as is unless you run your own server.",
+      "default": "https://api.spinsponsor.com"
+    }
+  }
+}
